@@ -1,9 +1,36 @@
 """
-Assignment 2 student implementation reference skeleton.
+Assignment 2 student implementation.
 
-This file documents the frozen student-facing API.
-Only 32-bit kernels are compulsory in the base track.
-64-bit and 128-bit kernels are intentionally left unimplemented here.
+Optimized 32-bit prover for the SumCheck protocol on the Boolean hypercube.
+
+Public API (frozen by the harness):
+    mod_add_32 / mod_sub_32 / mod_mul_32   -- 32-bit modular primitives
+    mle_update_32                          -- single-step MLE update
+    sumcheck_32(...)                       -- 32-bit prover
+    mod_add / mod_sub / mod_mul / mle_update / sumcheck   -- bit-width dispatchers
+
+Optimizations vs. the naive baseline:
+  * Per-round inner work is fully vectorized:
+      - For each variable name we compute its evaluations at t = 0, 1, ..., d
+        using a (d+1, half)-shaped tensor.  Composition for *all* t-values
+        runs in a single fused chain of jnp ops.
+  * Modular extrapolation along t uses an additive trick.  Since
+        mle_update(z, o, t) = z + t * (o - z),
+    the values for t = 2, 3, ..., d differ from the previous one by exactly
+    `diff = o - z`.  We compute t = 0 (= z), t = 1 (= o), and then add `diff`
+    repeatedly -- replacing (d-1) modular multiplies per row with cheap adds.
+  * Per-row sums collapsed via `jnp.sum(.. .astype(uint64)) % q`, instead of
+    a Python `while` loop of pairwise mod_adds.  Safe because every entry is
+    < q < 2^32 and the maximum row count we ever sum over is 2^(num_vars-1)
+    so the unreduced sum stays well below 2^64 for num_vars <= 31.
+  * `claim0` is derived from g_1(0) + g_1(1) instead of a separate full-table
+    pass over f.  Halves the work in round 1 effectively.
+  * The `diff` tensor we computed for evaluating g(t) is reused when folding
+    the table by the round challenge r_i (the fold is just z + r_i * diff).
+  * The fold after the final round is skipped (the baseline relied on JAX's
+    lenient OOB indexing of `challenges`).
+
+64-bit and 128-bit kernels remain unimplemented (extra-credit tracks).
 """
 
 from __future__ import annotations
@@ -20,11 +47,11 @@ jax.config.update("jax_enable_x64", True)
 @jax.jit
 def mod_add_32(a, b, q):
     """Return (a + b) mod q for the 32-bit track."""
-    # Do arithmetic in 64 bits to avoid overflow, then reduce mod q and cast back
     a64 = a.astype(jnp.uint64)
     b64 = b.astype(jnp.uint64)
     res = a64 + b64
     return jnp.where(res >= q, res - q, res).astype(jnp.uint32)
+
 
 @jax.jit
 def mod_sub_32(a, b, q):
@@ -33,6 +60,7 @@ def mod_sub_32(a, b, q):
     b64 = b.astype(jnp.int64)
     res = a64 - b64
     return jnp.where(res < 0, res + q, res).astype(jnp.uint32)
+
 
 @jax.jit
 def mod_mul_32(a, b, q):
@@ -45,51 +73,42 @@ def mod_mul_32(a, b, q):
 # -----------------------------------------------------------------------------
 # 64-bit primitives (optional, left for future implementation)
 # -----------------------------------------------------------------------------
-
 def mod_add_64(a, b, q):
     """Optional 64-bit modular add kernel."""
-    # TODO(student): implement when enabling 64-bit track.
     raise NotImplementedError
 
 
 def mod_sub_64(a, b, q):
     """Optional 64-bit modular subtract kernel."""
-    # TODO(student): implement when enabling 64-bit track.
     raise NotImplementedError
 
 
 def mod_mul_64(a, b, q):
     """Optional 64-bit modular multiply kernel."""
-    # TODO(student): implement when enabling 64-bit track.
     raise NotImplementedError
 
 
 # -----------------------------------------------------------------------------
 # 128-bit primitives (optional, left for future implementation)
 # -----------------------------------------------------------------------------
-
 def mod_add_128(a, b, q):
     """Optional 128-bit modular add kernel."""
-    # TODO(student): implement when enabling 128-bit track.
     raise NotImplementedError
 
 
 def mod_sub_128(a, b, q):
     """Optional 128-bit modular subtract kernel."""
-    # TODO(student): implement when enabling 128-bit track.
     raise NotImplementedError
 
 
 def mod_mul_128(a, b, q):
     """Optional 128-bit modular multiply kernel."""
-    # TODO(student): implement when enabling 128-bit track.
     raise NotImplementedError
 
 
 # -----------------------------------------------------------------------------
 # Frozen dispatch API
 # -----------------------------------------------------------------------------
-
 def mod_add(a, b, q, *, bit_width=32):
     if int(bit_width) == 32:
         return mod_add_32(a, b, q)
@@ -121,7 +140,7 @@ def mod_mul(a, b, q, *, bit_width=32):
 
 
 def mle_update_32(zero_eval, one_eval, target_eval, *, q):
-    """Compulsory 32-bit MLE update."""
+    """Compulsory 32-bit MLE update: returns (one - zero) * target + zero  mod q."""
     diff = mod_sub_32(one_eval, zero_eval, q)
     t_diff = mod_mul_32(target_eval, diff, q)
     return mod_add_32(zero_eval, t_diff, q)
@@ -129,13 +148,11 @@ def mle_update_32(zero_eval, one_eval, target_eval, *, q):
 
 def mle_update_64(zero_eval, one_eval, target_eval, *, q):
     """Optional 64-bit MLE update."""
-    # TODO(student): implement when enabling 64-bit track.
     raise NotImplementedError
 
 
 def mle_update_128(zero_eval, one_eval, target_eval, *, q):
     """Optional 128-bit MLE update."""
-    # TODO(student): implement when enabling 128-bit track.
     raise NotImplementedError
 
 
@@ -149,132 +166,140 @@ def mle_update(zero_eval, one_eval, target_eval, *, q, bit_width=32):
     raise ValueError(f"Unsupported bit_width={bit_width}")
 
 
+# -----------------------------------------------------------------------------
+# 32-bit sumcheck prover (compulsory)
+# -----------------------------------------------------------------------------
+def _row_sum_mod_q_32(arr, q, axis):
+    """Sum a uint32 array along `axis` and reduce mod q.
+
+    Casts to uint64 first so that summing up to ~2^31 entries each < 2^32 stays
+    safely inside 2^64.  Final result is cast back to uint32.
+    """
+    return (arr.astype(jnp.uint64).sum(axis=axis) % q).astype(jnp.uint32)
+
+
+def _base_evals_at_all_t_32(z, o, q, degree):
+    """Return (base_at_t, diff) where:
+
+        base_at_t : uint32 array of shape (degree + 1, *z.shape)
+                    base_at_t[t] = mle_update(z, o, t) = z + t * (o - z)  mod q
+        diff      : uint32 array of shape z.shape, diff = (o - z) mod q.
+
+    For t = 2, 3, ..., degree we use the additive identity
+        mle_update(z, o, t) = mle_update(z, o, t - 1) + diff   (mod q),
+    which replaces a modular multiply per row with a single modular add.
+    """
+    diff = mod_sub_32(o, z, q)
+    rows = [z, o]
+    cur = o
+    # degree - 1 extra rows to cover t = 2 .. degree
+    for _ in range(degree - 1):
+        cur = mod_add_32(cur, diff, q)
+        rows.append(cur)
+    base_at_t = jnp.stack(rows, axis=0)
+    return base_at_t, diff
+
+
 def sumcheck_32(eval_tables, *, q, expression, challenges, num_rounds):
     """Compulsory 32-bit sumcheck path.
 
     Parameters
     ----------
     eval_tables : dict[str, jax.Array]
-        Flat evaluation tables of shape (2**num_rounds,). x1 is LSB.
-    q           : JAX uint32 scalar — prime modulus.
-    expression  : list[list[str]] — e.g. [["a","b"],["c"]] means a*b + c.
-    challenges  : JAX array, length num_rounds — per-round field elements.
-                  Does NOT include the final verifier challenge.
-    num_rounds  : int — number of Boolean variables n.
+        Flat evaluation tables of shape (2**num_rounds,). x_1 is the LSB.
+    q           : JAX uint32 scalar -- prime modulus.
+    expression  : list[list[str]] -- e.g. [["a","b"], ["c"]] means a*b + c.
+    challenges  : JAX array of length (num_rounds - 1) -- per-round prover
+                  challenges; the verifier-only final challenge is excluded.
+    num_rounds  : int -- number of Boolean variables n.
 
     Returns
     -------
-    claim0      : JAX scalar — Σ_{x∈{0,1}^n} f(x)  mod q
-    round_evals : JAX array shape (num_rounds, degree+1)
-                  row i = [g_i(0), g_i(1), ..., g_i(d)]
+    claim0      : JAX uint32 scalar -- sum_{x in {0,1}^n} f(x) mod q.
+    round_evals : JAX uint32 array of shape (num_rounds, degree + 1).
+                  Row i = [g_i(0), g_i(1), ..., g_i(d)].
     """
-    # 1) Infer polynomial degree from expression
-    # Degree = length of the longest multiplicative term.
-    # [["a"]] → 1,  [["a","b"],["c"]] → 2,  [["a","b","c"]] → 3
     degree = max(len(term) for term in expression)
-    num_t_points = degree + 1   # evaluate at t = 0, 1, ..., degree
+    num_t_points = degree + 1
 
-    # Working copy of tables (values stay as uint32 JAX arrays)
+    # Working copy of tables (kept as uint32).  Use of dict is fine; iteration
+    # order is preserved (Python 3.7+).
     tables = {
         name: jnp.asarray(arr, dtype=jnp.uint32)
         for name, arr in eval_tables.items()
     }
 
-    # 2) claim0: sum f(x) over all 2^n Boolean inputs
-    some_name = next(iter(tables.keys()))
-    N_full = tables[some_name].shape[0]
-
-    # Evaluate composite polynomial f pointwise on the Boolean hypercube
-    flat_f = jnp.zeros(N_full, dtype=jnp.uint32)
-    for term in expression:                            # additive terms
-        product = jnp.ones(N_full, dtype=jnp.uint32)
-        for name in term:                              # multiplicative factors
-            product = mod_mul_32(product, tables[name], q)
-        flat_f = mod_add_32(flat_f, product, q)
-
-    # Reduce-sum flat_f mod q using modular add (tree fold)
-    tmp = flat_f
-    while tmp.shape[0] > 1:
-        h = tmp.shape[0] // 2
-        tmp = mod_add_32(tmp[:h], tmp[h:h * 2], q)
-    claim0 = tmp[0]   # scalar
-
-    # 3) Per-round prover loop
     all_round_evals = []
 
+    # Precompute the unique variable names per term as Python tuples so the
+    # JIT trace doesn't have to re-resolve dict keys each iteration.
+    expr_terms = [tuple(term) for term in expression]
+
     for rnd in range(num_rounds):
-        some_name = next(iter(tables.keys()))
-        N = tables[some_name].shape[0]
+        any_name = next(iter(tables.keys()))
+        N = tables[any_name].shape[0]
         half = N // 2
 
-        # Reshape (N,) → (half, 2):
-        #   column 0 = x_i = 0 (even indices)
-        #   column 1 = x_i = 1 (odd indices)
-        paired = {name: tables[name].reshape(half, 2) for name in tables}
+        # Even / odd split:
+        #   z  = entries with x_i = 0  (even indices)
+        #   o  = entries with x_i = 1  (odd indices)
+        z_o = {
+            name: (tables[name][0::2], tables[name][1::2])
+            for name in tables
+        }
 
-        # Compute g_rnd(t) for each evaluation point t
-        g_vals = []
-        for t in range(num_t_points):
+        # For each variable: base[name] of shape (d+1, half), diff[name] of
+        # shape (half,).
+        base_for_name = {}
+        diff_for_name = {}
+        for name, (z, o) in z_o.items():
+            base, diff = _base_evals_at_all_t_32(z, o, q, degree)
+            base_for_name[name] = base
+            diff_for_name[name] = diff
 
-            # For every base polynomial, produce a length-half array of
-            # values at (row, t), vectorized across all rows.
-            base_vecs = {}
-            for name, col_pair in paired.items():
-                z = col_pair[:, 0]   # (half,) — evaluations at x_i = 0
-                o = col_pair[:, 1]   # (half,) — evaluations at x_i = 1
-                if t == 0:
-                    base_vecs[name] = z
-                elif t == 1:
-                    base_vecs[name] = o
-                else:
-                    # Evaluate at t ≥ 2 using multilinear interpolation
-                    t_arr = jnp.asarray(t, dtype=jnp.uint32)
-                    base_vecs[name] = mle_update_32(z, o, t_arr, q=q)
+        # Vectorized composition: f at every (t, row).
+        # acc has shape (d+1, half).  We accumulate additive terms.
+        acc = jnp.zeros((num_t_points, half), dtype=jnp.uint32)
+        for term in expr_terms:
+            product = base_for_name[term[0]]
+            for name in term[1:]:
+                product = mod_mul_32(product, base_for_name[name], q)
+            acc = mod_add_32(acc, product, q)
 
-            # Evaluate composite expression for every row at this t
-            f_at_t = jnp.zeros(half, dtype=jnp.uint32)
-            for term in expression:
-                product = jnp.ones(half, dtype=jnp.uint32)
-                for name in term:
-                    product = mod_mul_32(product, base_vecs[name], q)
-                f_at_t = mod_add_32(f_at_t, product, q)
+        # Sum across rows -> g_round of shape (d+1,).  This is a single fused
+        # reduction and replaces the manual tree-fold of mod_adds.
+        g_round = _row_sum_mod_q_32(acc, q, axis=1)
+        all_round_evals.append(g_round)
 
-            # Sum f_at_t over all rows → g_rnd(t) scalar
-            tmp = f_at_t
-            while tmp.shape[0] > 1:
-                h = tmp.shape[0] // 2
-                tmp = mod_add_32(tmp[:h], tmp[h:h * 2], q)
-            g_vals.append(tmp[0])
+        # Fold tables for the next round (skip if this was the last round).
+        if rnd + 1 < num_rounds:
+            r_i = jnp.asarray(challenges[rnd], dtype=jnp.uint32)
+            new_tables = {}
+            for name, (z, _o) in z_o.items():
+                # mle_update(z, o, r_i) = z + r_i * diff.  diff is reused.
+                r_diff = mod_mul_32(r_i, diff_for_name[name], q)
+                new_tables[name] = mod_add_32(z, r_diff, q)
+            tables = new_tables
 
-        all_round_evals.append(g_vals)
+    round_evals = jnp.stack(all_round_evals, axis=0)  # (num_rounds, degree+1)
 
-        # Fold tables with challenge r_i to eliminate one Boolean variable
-        r_i = jnp.asarray(challenges[rnd], dtype=jnp.uint32)
-        new_tables = {}
-        for name in tables:
-            z_col = paired[name][:, 0]   # (half,)
-            o_col = paired[name][:, 1]   # (half,)
-            new_tables[name] = mle_update_32(z_col, o_col, r_i, q=q)
-        tables = new_tables
-
-    # 4) Pack round_evals into a single 2D JAX array: (num_rounds, degree+1)
-    round_evals = jnp.array(
-        [[v.astype(int) for v in row] for row in all_round_evals],
-        dtype=jnp.uint32,
-    )
+    # claim0 = g_1(0) + g_1(1)  mod q  (verifier consistency for round 1).
+    # Avoids a separate full-hypercube pass to compute the sum of f.
+    claim0 = mod_add_32(round_evals[0, 0], round_evals[0, 1], q)
 
     return claim0, round_evals
 
 
+# -----------------------------------------------------------------------------
+# 64-bit / 128-bit sumcheck (optional, left for future implementation)
+# -----------------------------------------------------------------------------
 def sumcheck_64(eval_tables, *, q, expression, challenges, num_rounds):
     """Optional 64-bit sumcheck path."""
-    # TODO(student): implement when enabling 64-bit track.
     raise NotImplementedError
 
 
 def sumcheck_128(eval_tables, *, q, expression, challenges, num_rounds):
     """Optional 128-bit sumcheck path."""
-    # TODO(student): implement when enabling 128-bit track.
     raise NotImplementedError
 
 
