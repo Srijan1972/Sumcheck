@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-extra=""
+extra="tpu"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | \
