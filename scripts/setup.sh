@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-extra="tpu"
+extra=""
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | \
@@ -12,6 +12,8 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   elif [ "${major}" -ge 525 ]; then
     extra="cuda12"
   fi
+elif [ -n "${TPU_ACCELERATOR_TYPE:-}" ]; then
+  extra="tpu"
 fi
 
 if [ -n "${extra}" ]; then
